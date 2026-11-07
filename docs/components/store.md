@@ -403,6 +403,7 @@ config:
   max_async_buffer_size: 0
   max_get_multi_concurrency: 0
   max_item_size: 0
+  cache_size: 0
   max_get_multi_batch_size: 0
   dns_provider_update_interval: 0s
   auto_discovery: false
@@ -436,6 +437,7 @@ While the remaining settings are **optional**:
 - `max_get_multi_concurrency`: maximum number of concurrent connections when fetching keys. If set to `0`, the concurrency is unlimited.
 - `max_get_multi_batch_size`: maximum number of keys a single underlying operation should fetch. If more keys are specified, internally keys are split into multiple batches and fetched concurrently, honoring `max_get_multi_concurrency`. If set to `0`, the batch size is unlimited.
 - `max_item_size`: maximum size of an item to be stored in memcached. This option should be set to the same value of memcached `-I` flag (defaults to 1MB) in order to avoid wasting network round trips to store items larger than the max item size allowed in memcached. If set to `0`, the item size is unlimited.
+- `cache_size`: maximum estimated size of the client-side LRU cache, including keys, values, and entry bookkeeping; `0` disables it.
 - `dns_provider_update_interval`: the DNS discovery update interval.
 - `auto_discovery`: whether to use the auto-discovery mechanism for memcached.
 - `set_async_circuit_breaker_config`: the configuration for the circuit breaker for asynchronous set operations.
@@ -447,6 +449,16 @@ While the remaining settings are **optional**:
   - `failure_percent`: the failure percentage, which is based on `min_requests`, to determine if the circuit breaker should open.
 - `enabled_items`: selectively choose what types of items to cache. Supported values are `Postings`, `Series` and `ExpandedPostings`. By default, all items are cached.
 - `ttl`: ttl to store index cache items in memcached.
+
+Client-side caching can be enabled by setting `cache_size` to a byte size such as `256MB` inside the Memcached `config`. The default is `0` (disabled). Each configured Memcached client maintains its own bounded LRU cache, so index caches, caching buckets, and different Store Gateway replicas have separate memory budgets. Allow memory for the configured cache size and allocator overhead for each client.
+
+`SetAsync` also stores a local copy when the entry fits the configured limits. A full asynchronous write queue or a failed remote write does not remove that copy. Reads check the local cache first and fetch only missing keys from Memcached using the existing batching and concurrency settings. Values fetched from Memcached are copied into the local cache only when their original expiration is known, using the same absolute expiration. Local entries may be evicted earlier to meet the size limit.
+
+When enabled, the client stores each remote entry's absolute expiration in Memcached's flags field without changing its value. Older Thanos clients can still read these values. Entries written without expiration metadata remain readable but are not promoted into the local cache. Rewriting such an entry from a caching client adds the metadata. This preserves TTLs for mutable caching-bucket entries as well as immutable index data.
+
+Memcached does not send invalidations to clients: a local copy can remain visible until its original TTL expires even if another client updates, deletes, or evicts the remote entry. Prefer this option for immutable data or workloads that tolerate that TTL-bounded staleness.
+
+The `thanos_memcached_client_cache_requests_total`, `thanos_memcached_client_cache_hits_total`, and `thanos_memcached_client_cache_size_bytes` metrics expose local-cache activity, labeled by client `name`. Existing Memcached operation metrics measure remote operations; index-cache request and hit metrics include both local and remote hits.
 
 ### Redis index cache
 

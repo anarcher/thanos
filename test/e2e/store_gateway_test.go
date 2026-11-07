@@ -623,9 +623,22 @@ func TestStoreGatewayNoCacheFile(t *testing.T) {
 }
 
 func TestStoreGatewayMemcachedCache(t *testing.T) {
+	testStoreGatewayMemcachedCache(t, false)
+}
+
+func TestStoreGatewayMemcachedClientCache(t *testing.T) {
+	testStoreGatewayMemcachedCache(t, true)
+}
+
+func testStoreGatewayMemcachedCache(t *testing.T, clientCache bool) {
+	t.Helper()
 	t.Parallel()
 
-	e, err := e2e.NewDockerEnvironment("store-memcached")
+	envName := "store-memcached"
+	if clientCache {
+		envName = "memcache-local"
+	}
+	e, err := e2e.NewDockerEnvironment(envName)
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
@@ -640,6 +653,9 @@ func TestStoreGatewayMemcachedCache(t *testing.T) {
 config:
   addresses: [%s]
 blocks_iter_ttl: 0s`, memcached.InternalEndpoint("memcached"))
+	if clientCache {
+		memcachedConfig = strings.Replace(memcachedConfig, "\nblocks_iter_ttl:", "\n  cache_size: 10MB\nblocks_iter_ttl:", 1)
+	}
 
 	s1 := e2ethanos.NewStoreGW(
 		e,
@@ -1017,9 +1033,22 @@ func TestRedisClient_Rueidis(t *testing.T) {
 }
 
 func TestStoreGatewayMemcachedIndexCacheExpandedPostings(t *testing.T) {
+	testStoreGatewayMemcachedIndexCacheExpandedPostings(t, false)
+}
+
+func TestStoreGatewayMemcachedClientCacheExpandedPostings(t *testing.T) {
+	testStoreGatewayMemcachedIndexCacheExpandedPostings(t, true)
+}
+
+func testStoreGatewayMemcachedIndexCacheExpandedPostings(t *testing.T, clientCache bool) {
+	t.Helper()
 	t.Parallel()
 
-	e, err := e2e.NewDockerEnvironment("memcached-expand")
+	envName := "memcached-expand"
+	if clientCache {
+		envName = "multi-cache-exp"
+	}
+	e, err := e2e.NewDockerEnvironment(envName)
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
@@ -1036,6 +1065,9 @@ config:
   max_async_concurrency: 10
   dns_provider_update_interval: 1s
   auto_discovery: false`, memcached.InternalEndpoint("memcached"))
+	if clientCache {
+		indexCacheConfig += "\n  cache_size: 10MB"
+	}
 
 	s1 := e2ethanos.NewStoreGW(
 		e,
@@ -1101,6 +1133,13 @@ config:
 		testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.Equals(0), []string{`thanos_store_index_cache_hits_total`}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "item_type", "ExpandedPostings"))))
 	})
 
+	remoteGetOpts := []e2emon.MetricsOption{e2emon.WithLabelMatchers(
+		matchers.MustNewMatcher(matchers.MatchEqual, "name", "index-cache"),
+		matchers.MustNewMatcher(matchers.MatchEqual, "operation", "getmulti"),
+	)}
+	remoteGets, err := s1.SumMetrics([]string{"thanos_memcached_operations_total"}, remoteGetOpts...)
+	testutil.Ok(t, err)
+
 	t.Run("query with cache hit", func(t *testing.T) {
 		queryAndAssertSeries(t, ctx, q.Endpoint("http"), func() string { return testQuery },
 			time.Now, promclient.QueryOptions{
@@ -1118,7 +1157,47 @@ config:
 
 		testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.Equals(2), []string{`thanos_store_index_cache_requests_total`}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "item_type", "ExpandedPostings"))))
 		testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.Equals(1), []string{`thanos_store_index_cache_hits_total`}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "item_type", "ExpandedPostings"))))
+		if clientCache {
+			// The repeated query must not issue another remote cache get.
+			testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.Equals(remoteGets[0]), []string{"thanos_memcached_operations_total"}, remoteGetOpts...))
+			testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.Greater(0), []string{"thanos_memcached_client_cache_hits_total"}, e2emon.WithLabelMatchers(
+				matchers.MustNewMatcher(matchers.MatchEqual, "name", "index-cache"),
+			)))
+		}
 	})
+
+	if clientCache {
+		t.Run("cold local cache warms from Memcached", func(t *testing.T) {
+			s2 := e2ethanos.NewStoreGW(e, "2", client.BucketConfig{
+				Type:   objstore.S3,
+				Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
+			}, "", indexCacheConfig, nil)
+			testutil.Ok(t, e2e.StartAndWaitReady(s2))
+			testutil.Ok(t, s2.WaitSumMetrics(e2emon.Equals(1), "thanos_bucket_store_blocks_loaded"))
+			q2 := e2ethanos.NewQuerierBuilder(e, "2", s2.InternalEndpoint("grpc")).Init()
+			testutil.Ok(t, e2e.StartAndWaitReady(q2))
+			var remoteGets []float64
+			for i := range 2 {
+				queryAndAssertSeries(t, ctx, q2.Endpoint("http"), func() string { return testQuery },
+					time.Now, promclient.QueryOptions{Deduplicate: false}, []model.Metric{
+						{"a": "1", "b": "2", "ext1": "value1", "replica": "1"},
+					})
+				if i == 0 {
+					remoteGets, err = s2.SumMetrics([]string{"thanos_memcached_operations_total"}, remoteGetOpts...)
+					testutil.Ok(t, err)
+					testutil.Assert(t, remoteGets[0] > 0)
+				} else {
+					testutil.Ok(t, s2.WaitSumMetricsWithOptions(e2emon.Equals(remoteGets[0]), []string{"thanos_memcached_operations_total"}, remoteGetOpts...))
+				}
+			}
+			testutil.Ok(t, s2.WaitSumMetricsWithOptions(e2emon.Greater(0), []string{"thanos_memcached_client_cache_hits_total"}, e2emon.WithLabelMatchers(
+				matchers.MustNewMatcher(matchers.MatchEqual, "name", "index-cache"),
+			)))
+			testutil.Ok(t, s2.WaitSumMetricsWithOptions(e2emon.Equals(2), []string{"thanos_store_index_cache_hits_total"}, e2emon.WithLabelMatchers(
+				matchers.MustNewMatcher(matchers.MatchEqual, "item_type", "ExpandedPostings"),
+			)))
+		})
+	}
 }
 
 func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {

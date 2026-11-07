@@ -189,6 +189,7 @@ func TestMemcachedClient_SetAsync(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Equals(t, []byte("value-1"), actual["key-1"].Value)
 	testutil.Equals(t, []byte("value-2"), actual["key-2"].Value)
+	testutil.Equals(t, uint32(0), actual["key-1"].Flags)
 
 	testutil.Equals(t, 2.0, prom_testutil.ToFloat64(client.operations.WithLabelValues(opSet)))
 	testutil.Equals(t, 1.0, prom_testutil.ToFloat64(client.operations.WithLabelValues(opGetMulti)))

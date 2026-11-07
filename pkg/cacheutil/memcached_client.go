@@ -137,6 +137,9 @@ type MemcachedClientConfig struct {
 	// If set to 0, no maximum size is enforced.
 	MaxItemSize model.Bytes `yaml:"max_item_size"`
 
+	// CacheSize bounds the estimated size of the client-side cache. Zero disables it.
+	CacheSize model.Bytes `yaml:"cache_size"`
+
 	// MaxGetMultiBatchSize specifies the maximum number of keys a single underlying
 	// GetMulti() should run. If more keys are specified, internally keys are split
 	// into multiple batches and fetched concurrently, honoring MaxGetMultiConcurrency parallelism.
@@ -210,6 +213,7 @@ type memcachedClient struct {
 	p *AsyncOperationProcessor
 
 	setAsyncCircuitBreaker CircuitBreaker
+	localCache             *memcachedClientCache
 }
 
 // AddressProvider performs node address resolution given a list of clusters.
@@ -295,6 +299,9 @@ func newMemcachedClient(
 		p:                      NewAsyncOperationProcessor(config.MaxAsyncBufferSize, config.MaxAsyncConcurrency),
 		setAsyncCircuitBreaker: newCircuitBreaker("memcached-set-async", config.SetAsyncCircuitBreaker),
 	}
+	if config.CacheSize > 0 {
+		c.localCache = newMemcachedClientCache(uint64(config.CacheSize), reg)
+	}
 
 	c.clientInfo = promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "thanos_memcached_client_info",
@@ -378,13 +385,22 @@ func newMemcachedClient(
 
 func (c *memcachedClient) Stop() {
 	c.p.Stop()
+	if c.localCache != nil {
+		c.localCache.clear()
+	}
 }
 
 func (c *memcachedClient) SetAsync(key string, value []byte, ttl time.Duration) error {
 	// Skip hitting memcached at all if the item is bigger than the max allowed size.
 	if c.config.MaxItemSize > 0 && uint64(len(value)) > uint64(c.config.MaxItemSize) {
+		if c.localCache != nil {
+			c.localCache.remove(key)
+		}
 		c.skipped.WithLabelValues(opSet, reasonMaxItemSize).Inc()
 		return nil
+	}
+	if c.localCache != nil {
+		c.localCache.set(key, value, time.Now().Add(ttl).Unix(), true)
 	}
 
 	err := c.p.EnqueueAsync(func() {
@@ -392,10 +408,19 @@ func (c *memcachedClient) SetAsync(key string, value []byte, ttl time.Duration) 
 		c.operations.WithLabelValues(opSet).Inc()
 
 		err := c.setAsyncCircuitBreaker.Execute(func() error {
+			expiration := int32(time.Now().Add(ttl).Unix())
+			var flags uint32
+			if c.localCache != nil {
+				// Preserve the absolute expiry for other caching clients. Ordinary
+				// Memcached gets do not return the remaining TTL. Older Thanos
+				// clients ignore flags and can still read the unchanged value.
+				flags = uint32(expiration) | memcachedClientCacheExpirationFlag
+			}
 			return c.client.Set(&memcache.Item{
 				Key:        key,
 				Value:      value,
-				Expiration: int32(time.Now().Add(ttl).Unix()),
+				Expiration: expiration,
+				Flags:      flags,
 			})
 		})
 		if err != nil {
@@ -436,6 +461,16 @@ func (c *memcachedClient) GetMulti(ctx context.Context, keys []string) map[strin
 	if len(keys) == 0 {
 		return nil
 	}
+	var hits map[string][]byte
+	if c.localCache != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		hits, keys = c.localCache.getMulti(keys)
+		if len(keys) == 0 || ctx.Err() != nil {
+			return hits
+		}
+	}
 
 	batches, err := c.getMultiBatched(ctx, keys)
 	if err != nil {
@@ -446,14 +481,21 @@ func (c *memcachedClient) GetMulti(ctx context.Context, keys []string) map[strin
 		// given returning some results from the cache is better than returning
 		// nothing.
 		if len(batches) == 0 {
-			return nil
+			return hits
 		}
 	}
 
-	hits := map[string][]byte{}
+	if hits == nil {
+		hits = map[string][]byte{}
+	}
 	for _, items := range batches {
 		for key, item := range items {
 			hits[key] = item.Value
+			if c.localCache != nil && item.Flags&memcachedClientCacheExpirationFlag != 0 {
+				// Missing/expired flags (including entries from older writers)
+				// cannot safely be promoted with a fresh TTL.
+				c.localCache.set(key, item.Value, int64(item.Flags&^memcachedClientCacheExpirationFlag), false)
+			}
 		}
 	}
 
